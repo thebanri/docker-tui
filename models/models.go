@@ -7,7 +7,9 @@ import (
 // ContainerData holds the information about a single Docker container.
 type ContainerData struct {
 	ID         string
+	GroupIDs   []string
 	Name       string
+	Project    string
 	Image      string
 	State      string // "running", "exited", etc.
 	Status     string // "Up 2 hours", etc.
@@ -31,7 +33,7 @@ const (
 
 // AppState represents the global state of the TUI
 type AppState struct {
-	Containers []ContainerData
+	Containers     []ContainerData
 	ConnectionType ConnectionType
 	ServerName     string // "" for local, "user@ip" for SSH
 	Error          error

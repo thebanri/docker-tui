@@ -40,7 +40,7 @@ var (
 	StyleNormalRow = lipgloss.NewStyle().
 			Foreground(ColorText)
 
-	StyleStatusUp = lipgloss.NewStyle().Foreground(ColorSuccess)
+	StyleStatusUp   = lipgloss.NewStyle().Foreground(ColorSuccess)
 	StyleStatusDown = lipgloss.NewStyle().Foreground(ColorDanger)
 
 	StyleHelp = lipgloss.NewStyle().
@@ -61,7 +61,7 @@ func DrawProgressBar(percent float64, width int) string {
 	}
 
 	inactiveChars := width - activeChars
-	
+
 	activeColor := ColorSuccess
 	if percent > 85 {
 		activeColor = ColorDanger
@@ -72,15 +72,17 @@ func DrawProgressBar(percent float64, width int) string {
 	activeStyle := lipgloss.NewStyle().Foreground(activeColor)
 	inactiveStyle := lipgloss.NewStyle().Foreground(ColorBgPanel)
 
-	// Since we can't easily draw solid blocks cross-platform without weird characters,
-	// standard block elements are usually safe.
 	blockChar := "█"
-	emptyChar := "░"
-	
-	activeStr := ""
-	for i:=0; i<activeChars; i++ { activeStr += blockChar }
-	inactiveStr := ""
-	for i:=0; i<inactiveChars; i++ { inactiveStr += emptyChar }
+	emptyChar := "─"
 
-	return activeStyle.Render(activeStr) + inactiveStyle.Render(inactiveStr)
+	activeStr := ""
+	for i := 0; i < activeChars; i++ {
+		activeStr += blockChar
+	}
+	inactiveStr := ""
+	for i := 0; i < inactiveChars; i++ {
+		inactiveStr += emptyChar
+	}
+
+	return "[" + activeStyle.Render(activeStr) + inactiveStyle.Render(inactiveStr) + "]"
 }

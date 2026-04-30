@@ -9,13 +9,18 @@ import (
 	"time"
 
 	"docker-tui/models"
+
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 )
 
 // Service interface for fetching docker data
 type Service interface {
 	GetContainers() ([]models.ContainerData, error)
+	StartContainers(ctx context.Context, ids []string) error
+	StopContainers(ctx context.Context, ids []string) error
+	RestartContainers(ctx context.Context, ids []string) error
 	Close() error
 }
 
@@ -39,10 +44,56 @@ func (s *LocalDockerService) Close() error {
 	return s.cli.Close()
 }
 
+func (s *LocalDockerService) StartContainers(ctx context.Context, ids []string) error {
+	var errs []string
+	for _, id := range ids {
+		if err := s.cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("start errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (s *LocalDockerService) StopContainers(ctx context.Context, ids []string) error {
+	var errs []string
+	for _, id := range ids {
+		if err := s.cli.ContainerStop(ctx, id, container.StopOptions{}); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("stop errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (s *LocalDockerService) RestartContainers(ctx context.Context, ids []string) error {
+	var errs []string
+	for _, id := range ids {
+		if err := s.cli.ContainerRestart(ctx, id, container.StopOptions{}); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("restart errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 func (s *LocalDockerService) GetContainers() ([]models.ContainerData, error) {
 	ctx := context.Background()
-	containers, err := s.cli.ContainerList(ctx, types.ContainerListOptions{All: true})
+	containers, err := s.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "Cannot connect to the Docker daemon") || strings.Contains(errStr, "connection refused") {
+			return nil, fmt.Errorf("Docker is not running locally")
+		}
+		if strings.Contains(errStr, "Docker is not installed, not running, or user lacks permissions on remote host") {
+			return nil, fmt.Errorf("Docker is not installed, not running, or user lacks permissions on remote host")
+		}
 		return nil, err
 	}
 
@@ -54,9 +105,28 @@ func (s *LocalDockerService) GetContainers() ([]models.ContainerData, error) {
 		wg.Add(1)
 		go func(c types.Container) {
 			defer wg.Done()
+			project := c.Labels["com.docker.compose.project"]
+			if project == "" {
+				nameWithoutSlash := strings.TrimPrefix(c.Names[0], "/")
+				idx1 := strings.Index(nameWithoutSlash, "_")
+				idx2 := strings.Index(nameWithoutSlash, "-")
+				idx := -1
+				if idx1 != -1 && (idx2 == -1 || idx1 < idx2) {
+					idx = idx1
+				} else if idx2 != -1 {
+					idx = idx2
+				}
+				if idx != -1 {
+					project = nameWithoutSlash[:idx]
+				} else {
+					project = nameWithoutSlash
+				}
+			}
+
 			data := models.ContainerData{
 				ID:      c.ID[:12],
 				Name:    strings.TrimPrefix(c.Names[0], "/"),
+				Project: project,
 				Image:   c.Image,
 				State:   c.State,
 				Status:  c.Status,
@@ -117,9 +187,9 @@ type v2Stats struct {
 		SystemCPUUsage uint64 `json:"system_cpu_usage"`
 	} `json:"precpu_stats"`
 	MemoryStats struct {
-		Usage    uint64 `json:"usage"`
-		Limit    uint64 `json:"limit"`
-		Stats    map[string]uint64 `json:"stats"`
+		Usage uint64            `json:"usage"`
+		Limit uint64            `json:"limit"`
+		Stats map[string]uint64 `json:"stats"`
 	} `json:"memory_stats"`
 	Networks map[string]struct {
 		RxBytes uint64 `json:"rx_bytes"`
@@ -166,7 +236,7 @@ func (s *LocalDockerService) getStats(ctx context.Context, id string) (parsedSta
 		onlineCPUs = 1
 	}
 	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		res.CPUPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+		res.CPUPercent = (cpuDelta / systemDelta) * 100.0
 	}
 
 	// Calculate Memory

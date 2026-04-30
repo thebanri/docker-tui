@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -18,6 +19,7 @@ type ViewMode int
 const (
 	ViewList ViewMode = iota
 	ViewSSHForm
+	ViewSSHSaved
 )
 
 type tickMsg time.Time
@@ -30,31 +32,36 @@ type SSHForm struct {
 }
 
 func newSSHForm() SSHForm {
-	var inputs []textinput.Model = make([]textinput.Model, 4)
-	
+	var inputs []textinput.Model = make([]textinput.Model, 5)
+
 	inputs[0] = textinput.New()
 	inputs[0].Placeholder = "Host (e.g. 192.168.1.100)"
 	inputs[0].Focus()
 	inputs[0].CharLimit = 156
-	inputs[0].Width = 30
+	inputs[0].Width = 40
 
 	inputs[1] = textinput.New()
 	inputs[1].Placeholder = "Port (e.g. 22)"
 	inputs[1].CharLimit = 5
-	inputs[1].Width = 30
+	inputs[1].Width = 40
 	inputs[1].SetValue("22")
 
 	inputs[2] = textinput.New()
 	inputs[2].Placeholder = "Username (e.g. root)"
 	inputs[2].CharLimit = 64
-	inputs[2].Width = 30
+	inputs[2].Width = 40
 
 	inputs[3] = textinput.New()
-	inputs[3].Placeholder = "Password"
+	inputs[3].Placeholder = "Password (Leave empty if using key)"
 	inputs[3].EchoMode = textinput.EchoPassword
 	inputs[3].EchoCharacter = '•'
 	inputs[3].CharLimit = 128
-	inputs[3].Width = 30
+	inputs[3].Width = 40
+
+	inputs[4] = textinput.New()
+	inputs[4].Placeholder = "Private Key (Path like ~/.ssh/id_rsa or raw content)"
+	inputs[4].CharLimit = 8192 // Can be very long if content
+	inputs[4].Width = 40
 
 	return SSHForm{inputs: inputs, focused: 0}
 }
@@ -67,6 +74,7 @@ type AppModel struct {
 	width         int
 	height        int
 	cursor        int
+	savedCursor   int
 }
 
 func NewAppModel(ds docker.Service) *AppModel {
@@ -120,7 +128,41 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.fetchContainersCmd(), m.tickCmd())
 
 	case containersMsg:
-		m.state.Containers = msg
+		// Group containers by Project
+		grouped := make(map[string]*models.ContainerData)
+		var orderedProjects []string
+
+		for _, c := range msg {
+			proj := c.Project
+			if proj == "" {
+				proj = c.Name
+			}
+			if existing, ok := grouped[proj]; ok {
+				existing.CPUPercent += c.CPUPercent
+				existing.MemPercent += c.MemPercent
+				existing.PIDs += c.PIDs
+				// Aggregate block/net IO strings is complex, just mark them as mixed or ignore
+				existing.Ports = "..."
+				if existing.State != c.State {
+					existing.State = "mixed"
+				}
+				existing.Name = proj + " (" + existing.ID + "...)" // Indicate group
+				existing.GroupIDs = append(existing.GroupIDs, c.ID)
+			} else {
+				orderedProjects = append(orderedProjects, proj)
+				copyC := c
+				copyC.Name = proj
+				copyC.GroupIDs = []string{c.ID}
+				grouped[proj] = &copyC
+			}
+		}
+
+		var aggregated []models.ContainerData
+		for _, proj := range orderedProjects {
+			aggregated = append(aggregated, *grouped[proj])
+		}
+
+		m.state.Containers = aggregated
 		m.state.Error = nil
 		if m.cursor >= len(m.state.Containers) {
 			m.cursor = len(m.state.Containers) - 1
@@ -150,8 +192,44 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor < len(m.state.Containers)-1 {
 					m.cursor++
 				}
+			case "a":
+				if len(m.state.Containers) > 0 {
+					c := m.state.Containers[m.cursor]
+					err := m.dockerService.StartContainers(context.Background(), c.GroupIDs)
+					if err != nil {
+						m.state.Error = err
+					} else {
+						cmds = append(cmds, m.fetchContainersCmd())
+					}
+				}
+			case "x":
+				if len(m.state.Containers) > 0 {
+					c := m.state.Containers[m.cursor]
+					err := m.dockerService.StopContainers(context.Background(), c.GroupIDs)
+					if err != nil {
+						m.state.Error = err
+					} else {
+						cmds = append(cmds, m.fetchContainersCmd())
+					}
+				}
+			case "r":
+				if len(m.state.Containers) > 0 {
+					c := m.state.Containers[m.cursor]
+					err := m.dockerService.RestartContainers(context.Background(), c.GroupIDs)
+					if err != nil {
+						m.state.Error = err
+					} else {
+						cmds = append(cmds, m.fetchContainersCmd())
+					}
+				}
 			case "s":
-				m.mode = ViewSSHForm
+				cfg := models.LoadConfig()
+				if len(cfg.SavedHosts) > 0 {
+					m.mode = ViewSSHSaved
+					m.savedCursor = 0
+				} else {
+					m.mode = ViewSSHForm
+				}
 			case "l":
 				// Switch back to local
 				if m.state.ConnectionType != models.LocalConnection {
@@ -190,12 +268,20 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				port := m.sshForm.inputs[1].Value()
 				user := m.sshForm.inputs[2].Value()
 				pass := m.sshForm.inputs[3].Value()
+				key := m.sshForm.inputs[4].Value()
 
 				// Connect via SSH
-				remoteService, err := ssh.NewRemoteDockerService(host, port, user, pass)
+				remoteService, err := ssh.NewRemoteDockerService(host, port, user, pass, key)
 				if err != nil {
 					m.state.Error = err
 				} else {
+					models.AddHostToConfig(models.SSHHost{
+						Host:       host,
+						Port:       port,
+						Username:   user,
+						Password:   pass,
+						PrivateKey: key,
+					})
 					if m.dockerService != nil {
 						m.dockerService.Close()
 					}
@@ -212,6 +298,39 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.sshForm.inputs[i], cmd = m.sshForm.inputs[i].Update(msg)
 				cmds = append(cmds, cmd)
+			}
+		} else if m.mode == ViewSSHSaved {
+			cfg := models.LoadConfig()
+			switch msg.String() {
+			case "esc":
+				m.mode = ViewList
+			case "up", "k":
+				if m.savedCursor > 0 {
+					m.savedCursor--
+				}
+			case "down", "j":
+				if m.savedCursor < len(cfg.SavedHosts)-1 {
+					m.savedCursor++
+				}
+			case "n":
+				m.mode = ViewSSHForm
+			case "enter":
+				if m.savedCursor >= 0 && m.savedCursor < len(cfg.SavedHosts) {
+					host := cfg.SavedHosts[m.savedCursor]
+					remoteService, err := ssh.NewRemoteDockerService(host.Host, host.Port, host.Username, host.Password, host.PrivateKey)
+					if err != nil {
+						m.state.Error = err
+					} else {
+						if m.dockerService != nil {
+							m.dockerService.Close()
+						}
+						m.dockerService = remoteService
+						m.state.ConnectionType = models.SSHConnection
+						m.state.ServerName = fmt.Sprintf("%s@%s", host.Username, host.Host)
+						m.mode = ViewList
+						cmds = append(cmds, m.fetchContainersCmd())
+					}
+				}
 			}
 		}
 	}
@@ -231,7 +350,7 @@ func (m *AppModel) View() string {
 	// Error banner if any
 	errStr := ""
 	if m.state.Error != nil {
-		errStr = lipgloss.NewStyle().Foreground(ColorText).Background(ColorDanger).Padding(0, 1).Render("Error: " + m.state.Error.Error()) + "\n\n"
+		errStr = lipgloss.NewStyle().Foreground(ColorText).Background(ColorDanger).Padding(0, 1).Render("Error: "+m.state.Error.Error()) + "\n\n"
 	}
 
 	content := ""
@@ -239,14 +358,18 @@ func (m *AppModel) View() string {
 		content = m.viewList()
 	} else if m.mode == ViewSSHForm {
 		content = m.viewSSHForm()
+	} else if m.mode == ViewSSHSaved {
+		content = m.viewSSHSaved()
 	}
 
 	// Footer
 	footer := ""
 	if m.mode == ViewList {
-		footer = StyleHelp.Render(" [↑/↓] Navigate  [s] Add SSH  [l] Switch to Local  [q] Quit ")
+		footer = StyleHelp.Render(" [↑/↓] Navigate  [a] Start  [x] Stop  [r] Restart  [s] SSH  [l] Local  [q] Quit ")
 	} else if m.mode == ViewSSHForm {
 		footer = StyleHelp.Render(" [Tab] Next Field  [Enter] Connect  [Esc] Cancel ")
+	} else if m.mode == ViewSSHSaved {
+		footer = StyleHelp.Render(" [↑/↓] Navigate  [Enter] Connect  [n] New Connection  [Esc] Cancel ")
 	}
 
 	layout := lipgloss.JoinVertical(lipgloss.Left,
@@ -268,8 +391,8 @@ func (m *AppModel) viewList() string {
 	// Calculate widths
 	wName := 25
 	wState := 10
-	wCPU := 15
-	wMem := 15
+	wCPU := 20
+	wMem := 20
 	wDisk := 15
 	wPorts := 20
 
@@ -295,11 +418,13 @@ func (m *AppModel) viewList() string {
 		stateStyle := StyleStatusDown
 		if c.State == "running" {
 			stateStyle = StyleStatusUp
+		} else if c.State == "mixed" {
+			stateStyle = lipgloss.NewStyle().Foreground(ColorWarning)
 		}
 
-		cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 8)
-		memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 8)
-		
+		cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 10)
+		memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 10)
+
 		rowContent := lipgloss.JoinHorizontal(lipgloss.Left,
 			fmt.Sprintf("%-*s", wName, name),
 			stateStyle.Render(fmt.Sprintf("%-*s", wState, c.State)),
@@ -321,12 +446,12 @@ func (m *AppModel) viewList() string {
 
 func (m *AppModel) viewSSHForm() string {
 	title := StyleTitle.Render("Add Remote Docker Server (SSH)")
-	
+
 	var inputs []string
 	for i := range m.sshForm.inputs {
 		inputs = append(inputs, m.sshForm.inputs[i].View())
 	}
-	
+
 	form := lipgloss.JoinVertical(lipgloss.Left,
 		title,
 		"",
@@ -339,9 +464,32 @@ func (m *AppModel) viewSSHForm() string {
 		"Username:",
 		inputs[2],
 		"",
-		"Password:",
+		"Password (optional):",
 		inputs[3],
+		"",
+		"Private Key Path/Content (optional):",
+		inputs[4],
 	)
 
 	return StylePanel.Render(form)
+}
+
+func (m *AppModel) viewSSHSaved() string {
+	title := StyleTitle.Render("Select Saved SSH Connection")
+	cfg := models.LoadConfig()
+
+	var rows []string
+	for i, h := range cfg.SavedHosts {
+		rowStr := fmt.Sprintf("%s@%s:%s", h.Username, h.Host, h.Port)
+		if i == m.savedCursor {
+			rows = append(rows, StyleActiveRow.Render("> "+rowStr))
+		} else {
+			rows = append(rows, StyleNormalRow.Render("  "+rowStr))
+		}
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left, title, "")
+	content = lipgloss.JoinVertical(lipgloss.Left, content, lipgloss.JoinVertical(lipgloss.Left, rows...))
+
+	return StylePanel.Render(content)
 }
