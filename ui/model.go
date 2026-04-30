@@ -88,6 +88,8 @@ type AppModel struct {
 	savedCursor   int
 	sortMode      SortMode
 	sortDesc      bool
+	showDetails   bool
+	activePanel   int // 0: List, 1: Details
 }
 
 func NewAppModel(ds docker.Service) *AppModel {
@@ -97,9 +99,11 @@ func NewAppModel(ds docker.Service) *AppModel {
 			ConnectionType: models.LocalConnection,
 			ServerName:     "localhost",
 		},
-		mode:     ViewList,
-		sshForm:  newSSHForm(),
-		sortMode: SortName,
+		mode:        ViewList,
+		sshForm:     newSSHForm(),
+		sortMode:    SortName,
+		showDetails: false,
+		activePanel: 0,
 	}
 }
 
@@ -211,6 +215,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				existing.CPUPercent += c.CPUPercent
 				existing.MemPercent += c.MemPercent
 				existing.PIDs += c.PIDs
+				existing.SubContainers = append(existing.SubContainers, c)
 
 				// Combine ports instead of hiding them
 				if c.Ports != "" {
@@ -241,13 +246,19 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				copyC := c
 				copyC.Name = proj
 				copyC.GroupIDs = []string{c.ID}
+				copyC.SubContainers = []models.ContainerData{c}
 				grouped[proj] = &copyC
 			}
 		}
 
 		var aggregated []models.ContainerData
 		for _, proj := range orderedProjects {
-			aggregated = append(aggregated, *grouped[proj])
+			pData := grouped[proj]
+			// Sort sub-containers by name to keep the list stable in ViewDetails
+			sort.Slice(pData.SubContainers, func(i, j int) bool {
+				return pData.SubContainers[i].Name < pData.SubContainers[j].Name
+			})
+			aggregated = append(aggregated, *pData)
 		}
 
 		m.applySortAndRestoreCursor(aggregated)
@@ -266,13 +277,26 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q":
 				return m, tea.Quit
+			case "tab":
+				if m.showDetails {
+					m.activePanel = (m.activePanel + 1) % 2
+				}
+			case "enter":
+				m.showDetails = !m.showDetails
+				if !m.showDetails {
+					m.activePanel = 0
+				}
 			case "up", "k":
-				if m.cursor > 0 {
-					m.cursor--
+				if m.activePanel == 0 {
+					if m.cursor > 0 {
+						m.cursor--
+					}
 				}
 			case "down", "j":
-				if m.cursor < len(m.state.Containers)-1 {
-					m.cursor++
+				if m.activePanel == 0 {
+					if m.cursor < len(m.state.Containers)-1 {
+						m.cursor++
+					}
 				}
 			case "o":
 				m.sortMode = (m.sortMode + 1) % 4
@@ -446,8 +470,16 @@ func (m *AppModel) View() string {
 		sortDirStr = "Desc"
 	}
 
-	headerText := fmt.Sprintf(" 🐳 Docker TUI | %s: %s | Sort: %s (%s) ", m.state.ConnectionType, m.state.ServerName, sortNameStr, sortDirStr)
-	header := StyleHeader.Render(headerText)
+	headerText := fmt.Sprintf(" 🐳 Tuidock | %s: %s | Sort: %s (%s) ", m.state.ConnectionType, m.state.ServerName, sortNameStr, sortDirStr)
+
+	// Layout sizing and centering logic
+	maxUIWidth := 140
+	uiWidth := m.width - 4
+	if uiWidth > maxUIWidth {
+		uiWidth = maxUIWidth
+	}
+
+	header := StyleHeader.Width(uiWidth + 4).Render(headerText)
 
 	// Error banner if any
 	errStr := ""
@@ -455,9 +487,34 @@ func (m *AppModel) View() string {
 		errStr = lipgloss.NewStyle().Foreground(ColorText).Background(ColorDanger).Padding(0, 1).Render("Error: "+m.state.Error.Error()) + "\n\n"
 	}
 
-	content := ""
+	var content string
 	if m.mode == ViewList {
-		content = m.viewList()
+		if m.showDetails {
+			leftWidth := (uiWidth / 2) - 1
+			rightWidth := uiWidth - leftWidth - 2
+
+			leftContent := m.viewList(leftWidth)
+			rightContent := m.viewDetails(rightWidth)
+
+			leftStyle := StylePanel.Copy().Width(leftWidth)
+			rightStyle := StylePanel.Copy().Width(rightWidth)
+
+			if m.activePanel == 0 {
+				leftStyle = leftStyle.BorderForeground(ColorPrimary)
+				// Dimmer neon when not focused (darker olive/yellow)
+				rightStyle = rightStyle.BorderForeground(lipgloss.Color("#667700"))
+			} else {
+				leftStyle = leftStyle.BorderForeground(ColorBgPanel)
+				rightStyle = rightStyle.BorderForeground(ColorNeon)
+			}
+
+			content = lipgloss.JoinHorizontal(lipgloss.Top,
+				leftStyle.Render(leftContent),
+				rightStyle.Render(rightContent),
+			)
+		} else {
+			content = StylePanel.Width(uiWidth).Render(m.viewList(uiWidth))
+		}
 	} else if m.mode == ViewSSHForm {
 		content = m.viewSSHForm()
 	} else if m.mode == ViewSSHSaved {
@@ -467,7 +524,11 @@ func (m *AppModel) View() string {
 	// Footer
 	footer := ""
 	if m.mode == ViewList {
-		footer = StyleHelp.Render(" [↑/↓] Navigate  [o] Sort  [i] Invert  [a] Start  [x] Stop  [r] Restart  [s] SSH  [l] Local  [q] Quit ")
+		help := " [↑/↓] Navigate  [Enter] Toggle Details  [o] Sort  [i] Invert  [a] Start  [x] Stop  [r] Restart  [s] SSH  [l] Local  [q] Quit "
+		if m.showDetails {
+			help = " [↑/↓] Navigate  [Tab] Switch Panel  [Enter] Close Details  [o] Sort  [i] Invert  [a/x/r] Actions  [q] Quit "
+		}
+		footer = StyleHelp.Render(help)
 	} else if m.mode == ViewSSHForm {
 		footer = StyleHelp.Render(" [Tab] Next Field  [Enter] Connect  [Esc] Cancel ")
 	} else if m.mode == ViewSSHSaved {
@@ -485,12 +546,12 @@ func (m *AppModel) View() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, layout)
 }
 
-func (m *AppModel) viewList() string {
+func (m *AppModel) viewList(width int) string {
 	if len(m.state.Containers) == 0 {
-		return StylePanel.Render("No containers found or loading...")
+		return "No containers found or loading..."
 	}
 
-	// Calculate widths
+	// Original widths or adjusted for split
 	wName := 25
 	wState := 10
 	wCPU := 22
@@ -498,14 +559,30 @@ func (m *AppModel) viewList() string {
 	wDisk := 18
 	wPorts := 20
 
+	// If we are in split mode (width is small), we prioritize Name and State, then CPU/RAM
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
 		lipgloss.NewStyle().Width(wName).PaddingRight(2).Render("NAME"),
 		lipgloss.NewStyle().Width(wState).PaddingRight(2).Render("STATE"),
-		lipgloss.NewStyle().Width(wCPU).PaddingRight(2).Render("CPU %"),
-		lipgloss.NewStyle().Width(wMem).PaddingRight(2).Render("RAM %"),
-		lipgloss.NewStyle().Width(wDisk).PaddingRight(2).Render("DISK I/O"),
-		lipgloss.NewStyle().Width(wPorts).Render("PORTS"),
 	)
+
+	showCPU := width > 50
+	showMem := width > 75
+	showDisk := width > 100
+	showPorts := width > 125
+
+	if showCPU {
+		headerRow = lipgloss.JoinHorizontal(lipgloss.Left, headerRow, lipgloss.NewStyle().Width(wCPU).PaddingRight(2).Render("CPU %"))
+	}
+	if showMem {
+		headerRow = lipgloss.JoinHorizontal(lipgloss.Left, headerRow, lipgloss.NewStyle().Width(wMem).PaddingRight(2).Render("RAM %"))
+	}
+	if showDisk {
+		headerRow = lipgloss.JoinHorizontal(lipgloss.Left, headerRow, lipgloss.NewStyle().Width(wDisk).PaddingRight(2).Render("DISK I/O"))
+	}
+	if showPorts {
+		headerRow = lipgloss.JoinHorizontal(lipgloss.Left, headerRow, lipgloss.NewStyle().Width(wPorts).Render("PORTS"))
+	}
+
 	headerRow = lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).Render(headerRow)
 
 	var rows []string
@@ -524,33 +601,25 @@ func (m *AppModel) viewList() string {
 			stateStyle = lipgloss.NewStyle().Foreground(ColorWarning)
 		}
 
-		cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 10)
-		memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 10)
-
-		diskIO := c.BlockIO
-		runesDisk := []rune(diskIO)
-		if len(runesDisk) > wDisk-1 {
-			if len(runesDisk) > wDisk-3 {
-				diskIO = string(runesDisk[:wDisk-3]) + ".."
-			}
-		}
-
-		ports := c.Ports
-		runesPorts := []rune(ports)
-		if len(runesPorts) > wPorts-1 {
-			if len(runesPorts) > wPorts-3 {
-				ports = string(runesPorts[:wPorts-3]) + ".."
-			}
-		}
-
 		rowContent := lipgloss.JoinHorizontal(lipgloss.Left,
 			lipgloss.NewStyle().Width(wName).PaddingRight(2).Render(name),
 			stateStyle.Copy().Width(wState).PaddingRight(2).Render(c.State),
-			lipgloss.NewStyle().Width(wCPU).PaddingRight(2).Render(cpuStr),
-			lipgloss.NewStyle().Width(wMem).PaddingRight(2).Render(memStr),
-			lipgloss.NewStyle().Width(wDisk).PaddingRight(2).Render(diskIO),
-			lipgloss.NewStyle().Width(wPorts).Render(ports),
 		)
+
+		if showCPU {
+			cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 10)
+			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wCPU).PaddingRight(2).Render(cpuStr))
+		}
+		if showMem {
+			memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 10)
+			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wMem).PaddingRight(2).Render(memStr))
+		}
+		if showDisk {
+			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wDisk).PaddingRight(2).Render(c.BlockIO))
+		}
+		if showPorts {
+			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wPorts).Render(c.Ports))
+		}
 
 		if i == m.cursor {
 			rows = append(rows, StyleActiveRow.Render(rowContent))
@@ -559,7 +628,58 @@ func (m *AppModel) viewList() string {
 		}
 	}
 
-	return StylePanel.Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func (m *AppModel) viewDetails(width int) string {
+	if len(m.state.Containers) == 0 || m.cursor >= len(m.state.Containers) {
+		return "No container selected"
+	}
+
+	c := m.state.Containers[m.cursor]
+
+	title := StyleTitle.Render("Container Details")
+	
+	info := []string{
+		fmt.Sprintf("ID:       %s", c.ID),
+		fmt.Sprintf("Name:     %s", c.Name),
+		fmt.Sprintf("Image:    %s", c.Image),
+		fmt.Sprintf("State:    %s", c.State),
+		fmt.Sprintf("Status:   %s", c.Status),
+		"",
+		StyleTitle.Render("Resource Usage"),
+		fmt.Sprintf("CPU %%:    %.2f%%", c.CPUPercent),
+		fmt.Sprintf("RAM %%:    %.2f%% (%s)", c.MemPercent, c.MemUsage),
+		fmt.Sprintf("Net I/O:  %s", c.NetIO),
+		fmt.Sprintf("Disk I/O: %s", c.BlockIO),
+		fmt.Sprintf("PIDs:     %d", c.PIDs),
+		"",
+	}
+
+	// Show sub-containers if it's a group
+	if len(c.SubContainers) > 1 {
+		info = append(info, StyleTitle.Render("Group Members"))
+		for _, sub := range c.SubContainers {
+			statusStyle := StyleStatusDown
+			if sub.State == "running" {
+				statusStyle = StyleStatusUp
+			}
+			portInfo := ""
+			if sub.Ports != "" {
+				portInfo = " :" + sub.Ports
+			}
+			info = append(info, fmt.Sprintf("- %s [%s]%s", sub.Name, statusStyle.Render(sub.State), portInfo))
+		}
+		info = append(info, "")
+	}
+
+	info = append(info, StyleTitle.Render("Network"))
+	info = append(info, fmt.Sprintf("Ports:    %s", c.Ports))
+
+	content := lipgloss.JoinVertical(lipgloss.Left, title, "")
+	content = lipgloss.JoinVertical(lipgloss.Left, content, lipgloss.JoinVertical(lipgloss.Left, info...))
+
+	return content
 }
 
 func (m *AppModel) viewSSHForm() string {

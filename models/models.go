@@ -6,10 +6,11 @@ import (
 
 // ContainerData holds the information about a single Docker container.
 type ContainerData struct {
-	ID         string
-	GroupIDs   []string
-	Name       string
-	Project    string
+	ID             string
+	GroupIDs       []string
+	SubContainers  []ContainerData // For grouped containers
+	Name           string
+	Project        string
 	Image      string
 	State      string // "running", "exited", etc.
 	Status     string // "Up 2 hours", etc.

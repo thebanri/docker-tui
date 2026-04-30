@@ -11,6 +11,7 @@ var (
 	ColorSuccess   = lipgloss.Color("#10B981") // Green
 	ColorWarning   = lipgloss.Color("#F59E0B") // Yellow
 	ColorDanger    = lipgloss.Color("#EF4444") // Red
+	ColorNeon      = lipgloss.Color("#CCFF00") // Neon Yellow
 	ColorText      = lipgloss.Color("#F8FAFC") // Light Gray
 	ColorTextMuted = lipgloss.Color("#64748B") // Slate
 	ColorBgDark    = lipgloss.Color("#0F172A") // Dark Slate
