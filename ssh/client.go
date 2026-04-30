@@ -67,10 +67,20 @@ func NewRemoteDockerService(host, port, user, password, privateKey string) (dock
 	addr := fmt.Sprintf("%s:%s", host, port)
 	sshClient, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
-		if strings.Contains(err.Error(), "ssh: handshake failed: ssh: unable to authenticate") {
-			return nil, fmt.Errorf("SSH authentication failed: incorrect password or invalid credentials")
+		errStr := err.Error()
+		if strings.Contains(errStr, "ssh: handshake failed: ssh: unable to authenticate") {
+			return nil, fmt.Errorf("AUTH FAILED: Password or private key is incorrect")
 		}
-		return nil, fmt.Errorf("ssh dial error: %w", err)
+		if strings.Contains(errStr, "connection refused") {
+			return nil, fmt.Errorf("NETWORK ERROR: Connection refused. Is the server IP/Port correct?")
+		}
+		if strings.Contains(errStr, "i/o timeout") {
+			return nil, fmt.Errorf("NETWORK ERROR: Connection timed out. Check your firewall or VPN")
+		}
+		if strings.Contains(errStr, "no route to host") {
+			return nil, fmt.Errorf("NETWORK ERROR: No route to host. Is the server online?")
+		}
+		return nil, fmt.Errorf("SSH ERROR: %v", err)
 	}
 
 	httpClient := &http.Client{

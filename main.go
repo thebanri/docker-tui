@@ -11,11 +11,9 @@ import (
 )
 
 func main() {
-	ds, err := docker.NewLocalDockerService()
-	if err != nil {
-		fmt.Printf("Error connecting to local docker daemon: %v\n", err)
-		// We don't exit immediately because they might want to use SSH only
-	}
+	ds, _ := docker.NewLocalDockerService()
+	// We don't check err strictly here because ui.NewAppModel handles ds == nil 
+	// by automatically switching to SSH view or saved hosts.
 
 	m := ui.NewAppModel(ds)
 	p := tea.NewProgram(m, tea.WithAltScreen())

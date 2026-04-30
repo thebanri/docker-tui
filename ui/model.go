@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 type ViewMode int
@@ -36,6 +37,10 @@ const (
 type tickMsg time.Time
 type containersMsg []models.ContainerData
 type errMsg struct{ err error }
+type restartFinishedMsg struct {
+	ids []string
+	err error
+}
 
 type SSHForm struct {
 	inputs  []textinput.Model
@@ -90,21 +95,41 @@ type AppModel struct {
 	sortDesc      bool
 	showDetails   bool
 	activePanel   int // 0: List, 1: Details
+	restartingIDs map[string]bool
+	firstFetchDone bool
 }
 
 func NewAppModel(ds docker.Service) *AppModel {
-	return &AppModel{
+	m := &AppModel{
 		dockerService: ds,
 		state: models.AppState{
 			ConnectionType: models.LocalConnection,
 			ServerName:     "localhost",
 		},
-		mode:        ViewList,
-		sshForm:     newSSHForm(),
-		sortMode:    SortName,
-		showDetails: false,
-		activePanel: 0,
+		mode:           ViewList,
+		sshForm:        newSSHForm(),
+		sortMode:       SortName,
+		showDetails:    false,
+		activePanel:    0,
+		restartingIDs:  make(map[string]bool),
+		firstFetchDone: false,
 	}
+
+	// If local docker is not available, try to show SSH options immediately
+	if ds == nil {
+		cfg := models.LoadConfig()
+		if len(cfg.SavedHosts) > 0 {
+			m.mode = ViewSSHSaved
+			m.state.ConnectionType = models.SSHConnection
+			m.state.ServerName = "Not Connected"
+		} else {
+			m.mode = ViewSSHForm
+			m.state.ConnectionType = models.SSHConnection
+			m.state.ServerName = "New Connection"
+		}
+	}
+
+	return m
 }
 
 func (m *AppModel) Init() tea.Cmd {
@@ -201,7 +226,24 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		cmds = append(cmds, m.fetchContainersCmd(), m.tickCmd())
 
+	case restartFinishedMsg:
+		for _, id := range msg.ids {
+			delete(m.restartingIDs, id)
+		}
+		if msg.err != nil {
+			m.state.Error = msg.err
+		}
+		cmds = append(cmds, m.fetchContainersCmd())
+
 	case containersMsg:
+		m.firstFetchDone = true
+		// Clear restartingIDs for containers that are now reported as running/stable
+		for _, c := range msg {
+			if c.State == "running" {
+				delete(m.restartingIDs, c.ID)
+			}
+		}
+
 		// Group containers by Project
 		grouped := make(map[string]*models.ContainerData)
 		var orderedProjects []string
@@ -327,11 +369,26 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				if len(m.state.Containers) > 0 {
 					c := m.state.Containers[m.cursor]
-					err := m.dockerService.RestartContainers(context.Background(), c.GroupIDs)
-					if err != nil {
-						m.state.Error = err
-					} else {
-						cmds = append(cmds, m.fetchContainersCmd())
+					// Check if any in group is already restarting
+					isRestarting := false
+					for _, id := range c.GroupIDs {
+						if m.restartingIDs[id] {
+							isRestarting = true
+							break
+						}
+					}
+
+					if !isRestarting {
+						for _, id := range c.GroupIDs {
+							m.restartingIDs[id] = true
+						}
+						// Run in background so UI doesn't freeze
+						return m, func() tea.Msg {
+							err := m.dockerService.RestartContainers(context.Background(), c.GroupIDs)
+							// We clear them in the next fetch or we could send a specific msg
+							// For simplicity, let's just finish the command
+							return restartFinishedMsg{ids: c.GroupIDs, err: err}
+						}
 					}
 				}
 			case "s":
@@ -353,6 +410,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.dockerService = local
 						m.state.ConnectionType = models.LocalConnection
 						m.state.ServerName = "localhost"
+						m.firstFetchDone = false
 						cmds = append(cmds, m.fetchContainersCmd())
 					} else {
 						m.state.Error = err
@@ -375,7 +433,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.sshForm.inputs[m.sshForm.focused].Focus()
 			case "enter":
-				// Submit form
+				// Clear previous error before trying
+				m.state.Error = nil
+				
 				host := m.sshForm.inputs[0].Value()
 				port := m.sshForm.inputs[1].Value()
 				user := m.sshForm.inputs[2].Value()
@@ -401,6 +461,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state.ConnectionType = models.SSHConnection
 					m.state.ServerName = fmt.Sprintf("%s@%s", user, host)
 					m.mode = ViewList
+					m.firstFetchDone = false
 					cmds = append(cmds, m.fetchContainersCmd())
 				}
 			}
@@ -440,6 +501,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.state.ConnectionType = models.SSHConnection
 						m.state.ServerName = fmt.Sprintf("%s@%s", host.Username, host.Host)
 						m.mode = ViewList
+						m.firstFetchDone = false
 						cmds = append(cmds, m.fetchContainersCmd())
 					}
 				}
@@ -470,7 +532,19 @@ func (m *AppModel) View() string {
 		sortDirStr = "Desc"
 	}
 
-	headerText := fmt.Sprintf(" 🐳 Tuidock | %s: %s | Sort: %s (%s) ", m.state.ConnectionType, m.state.ServerName, sortNameStr, sortDirStr)
+	// Segmented Header
+	logo := StyleHeaderLogo.Render(" 🐳 Tuidock ")
+	connInfo := StyleHeaderInfo.Render(fmt.Sprintf(" %s: %s ", m.state.ConnectionType, m.state.ServerName))
+	sortInfo := StyleHeaderSort.Render(fmt.Sprintf(" Sort: %s (%s) ", sortNameStr, sortDirStr))
+
+	// Join pieces with a small gap
+	header := lipgloss.JoinHorizontal(lipgloss.Top,
+		logo,
+		" ",
+		connInfo,
+		" ",
+		sortInfo,
+	)
 
 	// Layout sizing and centering logic
 	maxUIWidth := 140
@@ -479,7 +553,11 @@ func (m *AppModel) View() string {
 		uiWidth = maxUIWidth
 	}
 
-	header := StyleHeader.Width(uiWidth + 4).Render(headerText)
+	// Ensure header isn't too wide but matches style
+	headerWidth := lipgloss.Width(header)
+	if headerWidth < uiWidth {
+		// Fill space if needed or keep it segmented
+	}
 
 	// Error banner if any
 	errStr := ""
@@ -524,9 +602,38 @@ func (m *AppModel) View() string {
 	// Footer
 	footer := ""
 	if m.mode == ViewList {
-		help := " [↑/↓] Navigate  [Enter] Toggle Details  [o] Sort  [i] Invert  [a] Start  [x] Stop  [r] Restart  [s] SSH  [l] Local  [q] Quit "
+		var activeContainer *models.ContainerData
+		if len(m.state.Containers) > 0 && m.cursor >= 0 && m.cursor < len(m.state.Containers) {
+			activeContainer = &m.state.Containers[m.cursor]
+		}
+
+		actions := " [↑/↓] Navigate "
+		if activeContainer != nil {
+			// Check if restarting
+			isRestarting := false
+			for _, id := range activeContainer.GroupIDs {
+				if m.restartingIDs[id] {
+					isRestarting = true
+					break
+				}
+			}
+
+			if activeContainer.State != "running" {
+				actions += " [a] Start "
+			}
+			if activeContainer.State != "exited" && activeContainer.State != "created" {
+				actions += " [x] Stop "
+			}
+			if isRestarting {
+				actions += StyleStatusUp.Render(" [Restarting...] ")
+			} else {
+				actions += " [r] Restart "
+			}
+		}
+
+		help := actions + " [Enter] Details  [o] Sort  [i] Invert  [s] SSH  [l] Local  [q] Quit "
 		if m.showDetails {
-			help = " [↑/↓] Navigate  [Tab] Switch Panel  [Enter] Close Details  [o] Sort  [i] Invert  [a/x/r] Actions  [q] Quit "
+			help = actions + " [Tab] Switch Panel  [Enter] Close Details  [q] Quit "
 		}
 		footer = StyleHelp.Render(help)
 	} else if m.mode == ViewSSHForm {
@@ -548,7 +655,10 @@ func (m *AppModel) View() string {
 
 func (m *AppModel) viewList(width int) string {
 	if len(m.state.Containers) == 0 {
-		return "No containers found or loading..."
+		if !m.firstFetchDone {
+			return "Loading containers..."
+		}
+		return "No containers found."
 	}
 
 	// Original widths or adjusted for split
@@ -607,11 +717,11 @@ func (m *AppModel) viewList(width int) string {
 		)
 
 		if showCPU {
-			cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 10)
+			cpuStr := fmt.Sprintf("%5.1f%% ", c.CPUPercent) + DrawProgressBar(c.CPUPercent, 10, true)
 			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wCPU).PaddingRight(2).Render(cpuStr))
 		}
 		if showMem {
-			memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 10)
+			memStr := fmt.Sprintf("%5.1f%% ", c.MemPercent) + DrawProgressBar(c.MemPercent, 10, true)
 			rowContent = lipgloss.JoinHorizontal(lipgloss.Left, rowContent, lipgloss.NewStyle().Width(wMem).PaddingRight(2).Render(memStr))
 		}
 		if showDisk {
@@ -638,48 +748,111 @@ func (m *AppModel) viewDetails(width int) string {
 
 	c := m.state.Containers[m.cursor]
 
-	title := StyleTitle.Render("Container Details")
-	
-	info := []string{
-		fmt.Sprintf("ID:       %s", c.ID),
-		fmt.Sprintf("Name:     %s", c.Name),
-		fmt.Sprintf("Image:    %s", c.Image),
-		fmt.Sprintf("State:    %s", c.State),
-		fmt.Sprintf("Status:   %s", c.Status),
-		"",
-		StyleTitle.Render("Resource Usage"),
-		fmt.Sprintf("CPU %%:    %.2f%%", c.CPUPercent),
-		fmt.Sprintf("RAM %%:    %.2f%% (%s)", c.MemPercent, c.MemUsage),
-		fmt.Sprintf("Net I/O:  %s", c.NetIO),
-		fmt.Sprintf("Disk I/O: %s", c.BlockIO),
-		fmt.Sprintf("PIDs:     %d", c.PIDs),
-		"",
+	renderRow := func(label, value string, style lipgloss.Style) string {
+		visualWidth := lipgloss.Width(value)
+		if visualWidth > width-16 {
+			value = runewidth.Truncate(value, width-19, "...")
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			StyleDetailLabel.Render(label),
+			style.Render(value),
+		)
 	}
 
-	// Show sub-containers if it's a group
-	if len(c.SubContainers) > 1 {
-		info = append(info, StyleTitle.Render("Group Members"))
+	var sections []string
+
+	// General Info
+	image := c.Image
+	if strings.HasPrefix(image, "sha256:") {
+		image = image[7:19] + " (Hash)"
+	}
+
+	stateVal := c.State
+	stateStyle := StyleDetailValue
+	runningCount := 0
+	if len(c.SubContainers) > 0 {
 		for _, sub := range c.SubContainers {
-			statusStyle := StyleStatusDown
 			if sub.State == "running" {
-				statusStyle = StyleStatusUp
+				runningCount++
+			}
+		}
+		if c.State == "mixed" {
+			stateVal = fmt.Sprintf("Mixed (%d/%d Running)", runningCount, len(c.SubContainers))
+			stateStyle = lipgloss.NewStyle().Foreground(ColorWarning)
+		} else if c.State == "running" {
+			stateStyle = StyleStatusUp
+		} else {
+			stateStyle = StyleStatusDown
+		}
+	}
+
+	sections = append(sections, StyleTitle.Render("General Info"))
+	sections = append(sections, renderRow("ID", c.ID, StyleDetailValue))
+	sections = append(sections, renderRow("Name", c.Name, StyleDetailValue))
+	sections = append(sections, renderRow("Image", image, StyleDetailValue))
+	sections = append(sections, renderRow("State", stateVal, stateStyle))
+	sections = append(sections, renderRow("Status", c.Status, StyleDetailValue))
+	sections = append(sections, "")
+
+	// Resource Usage
+	resRows := []string{StyleTitle.Render("Resource Usage")}
+	
+	// Add Health Bar for groups
+	if len(c.SubContainers) > 1 {
+		healthPct := (float64(runningCount) / float64(len(c.SubContainers))) * 100.0
+		healthBar := DrawProgressBar(healthPct, 15, false) // high is NOT bad (high is good)
+		resRows = append(resRows, renderRow("Health", healthBar, StyleDetailValue))
+	}
+
+	cpu := fmt.Sprintf("%.2f%%", c.CPUPercent)
+	mem := fmt.Sprintf("%.2f%%", c.MemPercent)
+	if c.MemUsage != "" && c.MemUsage != "0B / 0B" {
+		mem += fmt.Sprintf(" (%s)", c.MemUsage)
+	}
+
+	resRows = append(resRows, renderRow("CPU %", cpu, StyleDetailValue))
+	resRows = append(resRows, renderRow("RAM %", mem, StyleDetailValue))
+	
+	if c.NetIO != "" && c.NetIO != "↓0B ↑0B" {
+		resRows = append(resRows, renderRow("Net I/O", c.NetIO, StyleDetailValue))
+	}
+	if c.BlockIO != "" && c.BlockIO != "↓0B ↑0B" {
+		resRows = append(resRows, renderRow("Disk I/O", c.BlockIO, StyleDetailValue))
+	}
+	if c.PIDs > 0 {
+		resRows = append(resRows, renderRow("PIDs", fmt.Sprintf("%d", c.PIDs), StyleDetailValue))
+	}
+	sections = append(sections, resRows...)
+	sections = append(sections, "")
+
+	// Group Members
+	if len(c.SubContainers) > 1 {
+		sections = append(sections, StyleTitle.Render("Group Members"))
+		for _, sub := range c.SubContainers {
+			subStatusStyle := StyleStatusDown
+			if sub.State == "running" {
+				subStatusStyle = StyleStatusUp
 			}
 			portInfo := ""
 			if sub.Ports != "" {
 				portInfo = " :" + sub.Ports
 			}
-			info = append(info, fmt.Sprintf("- %s [%s]%s", sub.Name, statusStyle.Render(sub.State), portInfo))
+			subName := sub.Name
+			if len(subName) > width-25 {
+				subName = subName[:width-28] + "..."
+			}
+			sections = append(sections, fmt.Sprintf("• %s [%s]%s", subName, subStatusStyle.Render(sub.State), portInfo))
 		}
-		info = append(info, "")
+		sections = append(sections, "")
 	}
 
-	info = append(info, StyleTitle.Render("Network"))
-	info = append(info, fmt.Sprintf("Ports:    %s", c.Ports))
+	// Network
+	if c.Ports != "" {
+		sections = append(sections, StyleTitle.Render("Network"))
+		sections = append(sections, renderRow("Ports", c.Ports, StyleDetailValue))
+	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, "")
-	content = lipgloss.JoinVertical(lipgloss.Left, content, lipgloss.JoinVertical(lipgloss.Left, info...))
-
-	return content
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 func (m *AppModel) viewSSHForm() string {

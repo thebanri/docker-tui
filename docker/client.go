@@ -37,6 +37,13 @@ func NewLocalDockerService() (Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Verify connection immediately
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = cli.Ping(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return &LocalDockerService{cli: cli}, nil
 }
 

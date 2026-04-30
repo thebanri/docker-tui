@@ -29,6 +29,23 @@ var (
 			Padding(0, 1).
 			Background(ColorPrimary)
 
+	StyleHeaderLogo = lipgloss.NewStyle().
+			Foreground(ColorText).
+			Bold(true).
+			Padding(0, 1).
+			Background(ColorPrimary)
+
+	StyleHeaderInfo = lipgloss.NewStyle().
+			Foreground(ColorText).
+			Padding(0, 1).
+			Background(ColorBgPanel)
+
+	StyleHeaderSort = lipgloss.NewStyle().
+			Foreground(ColorNeon).
+			Bold(true).
+			Padding(0, 1).
+			Background(lipgloss.Color("#1e293b"))
+
 	StylePanel = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(ColorPrimary).
@@ -47,9 +64,17 @@ var (
 	StyleHelp = lipgloss.NewStyle().
 			Foreground(ColorTextMuted).
 			MarginTop(1)
+
+	StyleDetailLabel = lipgloss.NewStyle().
+				Foreground(ColorTextMuted).
+				Bold(true).
+				Width(14)
+
+	StyleDetailValue = lipgloss.NewStyle().
+				Foreground(ColorText)
 )
 
-func DrawProgressBar(percent float64, width int) string {
+func DrawProgressBar(percent float64, width int, highIsBad bool) string {
 	if width < 5 {
 		width = 5
 	}
@@ -64,10 +89,19 @@ func DrawProgressBar(percent float64, width int) string {
 	inactiveChars := width - activeChars
 
 	activeColor := ColorSuccess
-	if percent > 85 {
-		activeColor = ColorDanger
-	} else if percent > 60 {
-		activeColor = ColorWarning
+	if highIsBad {
+		if percent > 85 {
+			activeColor = ColorDanger
+		} else if percent > 60 {
+			activeColor = ColorWarning
+		}
+	} else {
+		// High is good (e.g. Health)
+		if percent < 40 {
+			activeColor = ColorDanger
+		} else if percent < 80 {
+			activeColor = ColorWarning
+		}
 	}
 
 	activeStyle := lipgloss.NewStyle().Foreground(activeColor)
